@@ -1,0 +1,254 @@
+Verilog code
+SPI Protoco Design
+// ============================================
+// SPI MASTER MODULE
+// Supports Write and Read operations
+// CPOL=0, CPHA=0 (Mode 0)
+// ============================================
+module spi_master (
+input wire	clk,		// System clock input wire	 rst,	// Active-high reset input wire	start,		 // Start transfer
+input wire [7:0] data_in,	// Data to send (MOSI) output reg [7:0] data_out,		// Data received (MISO)
+output reg	sclk,	// SPI clock
+output reg	mosi,	// Master Out Slave In
+input wire	miso,	// Master In Slave Out
+output reg	cs_n,	// Chip select (active low)
+output reg	done	// Transfer complete
+);		
+
+reg [7:0] shift_reg;	// Shift register
+reg [3:0] bit_cnt;		// Bit counter (0 to 7) reg	busy;	// Busy flag
+
+// Clock divider (divide by 2 for simplicity) reg clk_div;
+always @(posedge clk or posedge rst) begin if (rst) clk_div <= 0;
+else	clk_div <= ~clk_div; end
+
+// SPI FSM
+ 
+always @(posedge clk or posedge rst) begin if (rst) begin
+sclk	<= 0;
+mosi	<= 0;
+cs_n	<= 1;
+done	<= 0;
+busy	<= 0;
+bit_cnt	<= 0;
+shift_reg <= 0;
+data_out <= 0; end
+else begin done <= 0;
+
+if (!busy && start) begin
+// Begin transfer cs_n	<= 0; shift_reg <= data_in; bit_cnt		<= 0;
+busy	<= 1;
+mosi	<= data_in[7]; // MSB first end
+
+else if (busy && clk_div) begin sclk <= ~sclk;
+
+if (!sclk) begin
+// Rising edge: shift out MOSI mosi	<= shift_reg[7];
+shift_reg <= {shift_reg[6:0], 1'b0}; end
+else begin
+// Falling edge: sample MISO
+ 
+data_out <= {data_out[6:0], miso}; bit_cnt <= bit_cnt + 1;
+
+if (bit_cnt == 7) begin
+// Transfer complete cs_n <= 1;
+sclk <= 0;
+busy <= 0;
+done <= 1; end
+end end
+end end
+
+endmodule
+// ============================================
+// SPI SLAVE MODULE
+// Receives from MOSI, Sends via MISO
+// CPOL=0, CPHA=0 (Mode 0)
+// ============================================
+module spi_slave (
+input wire	clk,		// System clock input wire	 rst,	// Active-high reset
+input wire	 sclk,	// SPI clock from master input wire	 mosi,			// Master Out Slave In output reg	 miso,			 // Master In Slave Out input wire	cs_n,		// Chip select (active low)
+output reg [7:0] rx_data,		 // Data received from master input wire [7:0] tx_data,		// Data to send to master output reg	rx_done	// Reception complete flag
+);
+ 
+reg [2:0] bit_cnt;	// 3-bit counter for 8 bits reg [7:0] shift_rx;	 // Receive shift register reg [7:0] shift_tx;	 // Transmit shift register
+reg	sclk_prev;	// Previous SCLK for edge detect
+
+wire sclk_rise = (!sclk_prev && sclk);		// Rising edge wire sclk_fall = (sclk_prev && !sclk);	// Falling edge
+
+always @(posedge clk or posedge rst) begin if (rst) begin
+bit_cnt	<= 0;
+shift_rx <= 0;
+shift_tx <= 0;
+rx_data	<= 0;
+miso	<= 0;
+rx_done	<= 0;
+sclk_prev <= 0; end
+else begin
+sclk_prev <= sclk; rx_done	<= 0;
+
+if (cs_n) begin
+// Idle: load tx data, reset counter shift_tx <= tx_data;
+bit_cnt <= 0;
+miso	<= tx_data[7]; // Pre-load MSB end
+else begin
+if (sclk_rise) begin
+// Sample MOSI on rising edge shift_rx <= {shift_rx[6:0], mosi}; bit_cnt <= bit_cnt + 1;
+ 
+if (bit_cnt == 7) begin
+rx_data <= {shift_rx[6:0], mosi}; rx_done <= 1;
+end end
+
+if (sclk_fall) begin
+// Drive MISO on falling edge shift_tx <= {shift_tx[6:0], 1'b0}; miso	<= shift_tx[6]; // Next bit
+end end
+end end
+
+endmodule
+// ============================================
+// SPI TOP MODULE
+// Connects SPI Master and SPI Slave
+// ============================================
+module spi_top ( input wire	clk,
+input wire	rst,
+input wire	start,
+input wire [7:0] master_tx_data,		 // Master sends this input wire [7:0] slave_tx_data,	// Slave sends this output wire [7:0] master_rx_data,		// Master receives this output wire [7:0] slave_rx_data,		// Slave receives this output wire	master_done,
+output wire	slave_done
+);
+ 
+// SPI bus wires wire sclk;
+wire mosi; wire miso; wire cs_n;
+
+// ---- SPI Master Instance ---- spi_master u_master (
+.clk	(clk),
+.rst	(rst),
+.start	(start),
+.data_in (master_tx_data),
+.data_out (master_rx_data),
+.sclk	(sclk),
+.mosi	(mosi),
+.miso	(miso),
+.cs_n	(cs_n),
+.done	(master_done)
+);
+
+// ---- SPI Slave Instance ---- spi_slave u_slave (
+.clk	(clk),
+.rst	(rst),
+.sclk	(sclk),
+.mosi	(mosi),
+.miso	(miso),
+.cs_n	(cs_n),
+.rx_data (slave_rx_data),
+.tx_data (slave_tx_data),
+.rx_done (slave_done)
+);
+ 
+endmodule
+// ============================================
+// SPI TESTBENCH
+// Tests both Write and Read operations
+// ============================================
+`timescale 1ns/1ps module spi_tb;
+// Inputs reg	clk;
+reg	rst;
+reg	start;
+reg [7:0] master_tx_data;
+reg [7:0] slave_tx_data;
+
+// Outputs
+wire [7:0] master_rx_data;
+wire [7:0] slave_rx_data; wire	 master_done; wire	slave_done;
+
+// Instantiate Top Module spi_top uut (
+.clk	(clk),
+.rst	(rst),
+.start	(start),
+.master_tx_data (master_tx_data),
+.slave_tx_data (slave_tx_data),
+.master_rx_data (master_rx_data),
+.slave_rx_data (slave_rx_data),
+.master_done	(master_done),
+.slave_done	(slave_done)
+ 
+);
+
+// Clock generation: 10ns period initial clk = 0;
+always #5 clk = ~clk;
+
+// Monitor signals initial begin
+$monitor("Time=%0t | start=%b | M_TX=%h | S_TX=%h | M_RX=%h | S_RX=%h | M_Done=%b | S_Done=%b",
+$time, start, master_tx_data, slave_tx_data, master_rx_data, slave_rx_data, master_done, slave_done);
+end
+
+// Stimulus initial begin
+// ---- Initialize ---- rst	= 1;
+start	= 0; master_tx_data = 8'h00; slave_tx_data = 8'h00; #20;
+rst = 0;
+#10;
+
+// ============================================
+// TEST 1: WRITE Operation
+// Master sends 0xA5 to Slave
+// ============================================
+$display("\n--- TEST 1: WRITE (Master -> Slave) ---"); master_tx_data = 8'hA5;	// Master writes this
+slave_tx_data = 8'h00;	// Slave not sending meaningful data start = 1;
+ 
+#10;
+start = 0;
+
+// Wait for master done @(posedge master_done); #20;
+
+$display("WRITE RESULT: Master sent = 0x%h | Slave received = 0x%h", master_tx_data, slave_rx_data);
+
+if (slave_rx_data == 8'hA5)
+$display("WRITE TEST PASSED!");
+else
+$display("WRITE TEST FAILED!"); #50;
+// ============================================
+// TEST 2: READ Operation
+// Slave sends 0x3C back to Master
+// ============================================
+$display("\n--- TEST 2: READ (Slave -> Master) ---");
+master_tx_data = 8'hFF;		// Dummy byte from master (just to drive clock) slave_tx_data = 8'h3C;	// Slave sends this back
+start = 1;
+#10;
+start = 0;
+
+// Wait for master done @(posedge master_done); #20;
+
+$display("READ RESULT: Slave sent = 0x%h | Master received = 0x%h",
+ 
+slave_tx_data, master_rx_data);
+
+if (master_rx_data == 8'h3C)
+$display("READ TEST PASSED!");
+else
+$display("READ TEST FAILED!"); #50;
+// ============================================
+// TEST 3: Simultaneous Write + Read
+// Master sends 0xB2, Slave sends 0x4D
+// ============================================
+$display("\n--- TEST 3: Simultaneous Write + Read ---"); master_tx_data = 8'hB2;
+slave_tx_data = 8'h4D; start = 1;
+#10;
+start = 0;
+
+@(posedge master_done); #20;
+
+$display("SIMULTANEOUS RESULT:");
+$display(" Master sent = 0x%h | Slave received = 0x%h", master_tx_data, slave_rx_data);
+$display(" Slave sent = 0x%h | Master received = 0x%h", slave_tx_data, master_rx_data);
+
+if (slave_rx_data == 8'hB2 && master_rx_data == 8'h4D)
+$display("SIMULTANEOUS TEST PASSED!");
+else
+$display("SIMULTANEOUS TEST FAILED!");
+ 
+#100;$display("\n=== ALL TESTS COMPLETE ===");
+$finish; end
+
+// Waveform dump initial begin
+$dumpfile("spi_wave.vcd");
+$dumpvars(0, spi_tb); end
+
+endmodule

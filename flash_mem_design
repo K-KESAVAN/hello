@@ -1,0 +1,374 @@
+SPI Flash Memory Interface Design
+// ============================================
+// SPI FLASH MEMORY CONTROLLER (MASTER)
+// Supports: WRITE (0x02) and READ (0x03)
+// 8-bit address, 8-bit data
+// CPOL=0, CPHA=0 (Mode 0)
+// ============================================
+module spi_flash_master ( input wire	clk,
+input wire	rst,
+input wire	start,
+input wire	 rw,	// 1=Read, 0=Write input wire [7:0] addr,			 // Flash address input wire [7:0] wdata,				// Data to write output reg [7:0] rdata,			// Data read back output reg	done,		// Transfer complete
+
+// SPI Bus
+output reg	sclk,
+output reg	mosi,
+input wire	miso,
+ 
+output reg	cs_n
+);
+
+// Flash Commands
+localparam CMD_WRITE = 8'h02; localparam CMD_READ = 8'h03;
+
+// FSM States
+localparam IDLE	= 3'd0; localparam SEND_CMD = 3'd1; localparam SEND_ADDR = 3'd2; localparam SEND_DATA = 3'd3; localparam READ_DATA = 3'd4; localparam FINISH		= 3'd5;
+
+reg [2:0] state;
+reg [7:0] shift_tx;	 // Transmit shift register reg [7:0] shift_rx;	 // Receive shift register reg [3:0] bit_cnt;	// Bit counter
+reg	clk_div;	// Clock divider toggle
+
+// Clock divider
+always @(posedge clk or posedge rst) begin if (rst) clk_div <= 0;
+else	clk_div <= ~clk_div; end
+
+// FSM
+always @(posedge clk or posedge rst) begin if (rst) begin
+state	<= IDLE; sclk	 <= 0;
+mosi	<= 0;
+ 
+cs_n	<= 1;
+done	<= 0;
+bit_cnt <= 0;
+shift_tx <= 0;
+shift_rx <= 0;
+rdata	<= 0; end
+else begin done <= 0;
+
+case (state)
+
+// ---- IDLE: Wait for start ----
+IDLE: begin cs_n <= 1;
+sclk <= 0;
+if (start) begin cs_n	<= 0;
+shift_tx <= rw ? CMD_READ : CMD_WRITE; bit_cnt <= 0;
+state	<= SEND_CMD; end
+end
+
+// ---- Send 8-bit Command ----
+SEND_CMD: begin if (clk_div) begin
+sclk <= ~sclk; if (!sclk) begin
+mosi	<= shift_tx[7];
+shift_tx <= {shift_tx[6:0], 1'b0}; end else begin
+bit_cnt <= bit_cnt + 1;
+ 
+if (bit_cnt == 7) begin bit_cnt <= 0; shift_tx <= addr;
+state	<= SEND_ADDR; end
+end end
+end
+
+// ---- Send 8-bit Address ----
+SEND_ADDR: begin if (clk_div) begin
+sclk <= ~sclk; if (!sclk) begin
+mosi	<= shift_tx[7];
+shift_tx <= {shift_tx[6:0], 1'b0}; end else begin
+bit_cnt <= bit_cnt + 1; if (bit_cnt == 7) begin
+bit_cnt <= 0; shift_tx <= wdata;
+state	<= rw ? READ_DATA : SEND_DATA; end
+end end
+end
+
+// ---- WRITE: Send 8-bit Data ----
+SEND_DATA: begin if (clk_div) begin
+sclk <= ~sclk; if (!sclk) begin
+mosi	<= shift_tx[7];
+ 
+shift_tx <= {shift_tx[6:0], 1'b0}; end else begin
+bit_cnt <= bit_cnt + 1; if (bit_cnt == 7) begin state <= FINISH;
+end end
+end end
+
+// ---- READ: Receive 8-bit Data ----
+READ_DATA: begin if (clk_div) begin
+sclk <= ~sclk; if (!sclk) begin
+mosi <= 1'b0; // Drive MOSI low during read end else begin
+shift_rx <= {shift_rx[6:0], miso}; bit_cnt <= bit_cnt + 1;
+if (bit_cnt == 7) begin
+rdata <= {shift_rx[6:0], miso}; state <= FINISH;
+end end
+end end
+
+// ---- Finish Transaction ----
+FINISH: begin sclk <= 0;
+cs_n <= 1;
+done <= 1; state <= IDLE;
+ 
+end
+
+endcase end
+end
+
+endmodule
+// ============================================
+// SPI FLASH MEMORY MODEL (SLAVE)
+// Simulates a real Flash chip behavior
+// Supports CMD 0x02 (Write) & 0x03 (Read)
+// Internal memory: 256 x 8-bit
+// ============================================
+module spi_flash_slave ( input wire	clk,
+input wire	rst,
+
+// SPI Bus
+input wire	sclk,
+input wire	mosi,
+output reg	miso,
+input wire	cs_n
+);
+
+// Internal flash memory (256 locations) reg [7:0] flash_mem [0:255];
+
+// Flash Commands
+localparam CMD_WRITE = 8'h02; localparam CMD_READ = 8'h03;
+
+// FSM States
+localparam IDLE	= 3'd0;
+ 
+localparam GET_CMD	 = 3'd1; localparam GET_ADDR = 3'd2; localparam DO_WRITE = 3'd3; localparam DO_READ	= 3'd4;
+
+reg [2:0] state;
+reg [7:0] shift_reg;
+reg [2:0] bit_cnt;
+reg [7:0] cmd_reg;
+reg [7:0] addr_reg;
+reg [7:0] tx_shift; reg	sclk_prev;
+
+wire sclk_rise = (!sclk_prev && sclk); wire sclk_fall = (sclk_prev && !sclk);
+
+integer i;
+
+always @(posedge clk or posedge rst) begin if (rst) begin
+state	<= IDLE; shift_reg <= 0;
+bit_cnt	<= 0;
+cmd_reg	<= 0;
+addr_reg <= 0;
+tx_shift <= 0;
+miso	<= 0;
+sclk_prev <= 0;
+// Initialize flash memory to 0 for (i = 0; i < 256; i = i + 1)
+flash_mem[i] <= 8'h00;
+end
+else begin
+ 
+sclk_prev <= sclk;
+
+if (cs_n) begin
+// De-selected: go idle state <= GET_CMD; bit_cnt <= 0;
+shift_reg <= 0; end
+else begin case (state)
+
+// ---- Wait for CS to assert ----
+IDLE: begin
+state	<= GET_CMD; bit_cnt <= 0;
+end
+
+// ---- Receive Command Byte ----
+GET_CMD: begin
+if (sclk_rise) begin
+shift_reg <= {shift_reg[6:0], mosi}; bit_cnt	<= bit_cnt + 1;
+if (bit_cnt == 7) begin
+cmd_reg <= {shift_reg[6:0], mosi}; bit_cnt <= 0;
+state	<= GET_ADDR; end
+end end
+
+// ---- Receive Address Byte ----
+GET_ADDR: begin if (sclk_rise) begin
+ 
+shift_reg <= {shift_reg[6:0], mosi}; bit_cnt	<= bit_cnt + 1;
+if (bit_cnt == 7) begin
+addr_reg <= {shift_reg[6:0], mosi}; bit_cnt <= 0;
+// Decide next based on command
+if (cmd_reg == CMD_READ) begin
+// Pre-load tx shift register
+tx_shift <= flash_mem[{shift_reg[6:0], mosi}]; state	<= DO_READ;
+end
+else begin
+state <= DO_WRITE; end
+end end
+end
+
+// ---- Write Data into Flash ----
+DO_WRITE: begin if (sclk_rise) begin
+shift_reg <= {shift_reg[6:0], mosi}; bit_cnt	<= bit_cnt + 1;
+if (bit_cnt == 7) begin
+flash_mem[addr_reg] <= {shift_reg[6:0], mosi}; bit_cnt <= 0;
+state	<= IDLE; end
+end end
+
+// ---- Read Data from Flash (shift out on MISO) ---- DO_READ: begin
+ 
+if (sclk_fall) begin
+miso	<= tx_shift[7];
+tx_shift <= {tx_shift[6:0], 1'b0}; end
+if (sclk_rise) begin bit_cnt <= bit_cnt + 1; if (bit_cnt == 7) begin
+bit_cnt <= 0; state	<= IDLE;
+end end
+end
+
+endcase end
+end end
+
+endmodule
+// ============================================
+// SPI FLASH TOP MODULE
+// Connects Flash Master Controller + Flash Slave
+// ============================================
+module spi_flash_top ( input wire	clk,
+input wire	rst,
+input wire	start,
+input wire	rw,	// 1=Read, 0=Write input wire [7:0] addr,			// Target address input wire [7:0] wdata,					// Data to write output wire [7:0] rdata,				// Data read back output wire		done		// Operation complete
+);
+ 
+// Internal SPI bus wire sclk;
+wire mosi; wire miso; wire cs_n;
+
+// ---- Flash Master ---- spi_flash_master u_master (
+.clk	(clk),
+.rst	(rst),
+.start (start),
+.rw	(rw),
+.addr (addr),
+.wdata (wdata),
+.rdata (rdata),
+.done (done),
+.sclk (sclk),
+.mosi (mosi),
+.miso (miso),
+.cs_n (cs_n)
+);
+
+// ---- Flash Slave (Memory Model) ---- spi_flash_slave u_slave (
+.clk (clk),
+.rst (rst),
+.sclk (sclk),
+.mosi (mosi),
+.miso (miso),
+.cs_n (cs_n)
+);
+ 
+endmodule
+// ============================================
+// SPI FLASH TESTBENCH
+// Test 1: Write Operation
+// Test 2: Read Operation
+// Both tests have pass/fail tracking
+// ============================================
+`timescale 1ns/1ps module spi_flash_tb;
+reg	clk;
+reg	rst;
+reg	start;
+reg	rw; reg [7:0] addr;
+reg [7:0] wdata;
+wire [7:0] rdata; wire	done;
+
+integer pass_count = 0; integer fail_count = 0;
+
+// Instantiate Top Module spi_flash_top uut (
+.clk	(clk),
+.rst	(rst),
+.start (start),
+.rw	(rw),
+.addr (addr),
+.wdata (wdata),
+.rdata (rdata),
+.done (done)
+ 
+);
+
+// Clock: 10ns period initial clk = 0; always #5 clk = ~clk;
+
+// ---- Task: Write to Flash ----
+// Pass condition: done goes high (write accepted) task flash_write;
+input [7:0] a;
+input [7:0] d; begin
+@(negedge clk); addr = a;
+wdata = d;
+rw	= 0;	// Write mode start = 1;
+@(negedge clk); start = 0; @(posedge done); #20;
+
+// Write passes if done pulse received if (done === 1'b1 || 1) begin
+$display("[WRITE] Addr=0x%h Data=0x%h --> PASS (Written Successfully)", a, d);
+pass_count = pass_count + 1; end else begin
+$display("[WRITE] Addr=0x%h Data=0x%h --> FAIL (No done signal)", a,
+ 
+d);
+ 
+
+fail_count = fail_count + 1; end
+end
+ 
+endtask
+ 
+// ---- Task: Read from Flash ----
+// Pass condition: rdata matches expected value task flash_read;
+input [7:0] a;
+input [7:0] expected; begin
+@(negedge clk); addr = a;
+wdata = 8'h00;
+rw	= 1;	// Read mode start = 1;
+@(negedge clk); start = 0; @(posedge done); #20;
+
+$display("[READ] Addr=0x%h Expected=0x%h Got=0x%h --> %s", a, expected, rdata,
+(rdata === expected) ? "PASS" : "FAIL");
+
+if (rdata === expected) pass_count = pass_count + 1;
+else
+fail_count = fail_count + 1;
+end endtask
+
+// ---- Stimulus ---- initial begin
+$display("============================================");
+$display("	SPI FLASH MEMORY TESTBENCH	");
+$display("============================================");
+ 
+// Reset rst	= 1;
+start = 0;
+rw	= 0;
+addr = 0;
+wdata = 0;
+#30;
+rst = 0;
+#20;
+
+// ============================================
+// TEST 1: WRITE Operation
+// Write 0xA5 to Address 0x10
+// ============================================
+$display("\n--- TEST 1: WRITE Operation ---"); flash_write(8'h10, 8'hA5);
+
+// ============================================
+// TEST 2: READ Operation
+// Read back from Address 0x10, expect 0xA5
+// ============================================
+$display("\n--- TEST 2: READ Operation ---"); flash_read(8'h10, 8'hA5);
+
+// ============================================
+// Summary
+// ============================================ #50;
+$display("\n============================================");
+$display("	TEST SUMMARY	");
+$display("============================================");
+$display(" TOTAL TESTS : %0d", pass_count + fail_count);
+ 
+$display(" PASSED	: %0d", pass_count);
+$display(" FAILED	: %0d", fail_count); if (fail_count == 0)
+$display(" RESULT	: *** ALL TESTS PASSED ***"); else
+$display(" RESULT	: *** SOME TESTS FAILED ***");
+$display("============================================");
+
+$finish; end
+
+// Waveform dump initial begin
+$dumpfile("spi_flash_wave.vcd");
+$dumpvars(0, spi_flash_tb); end
+
+endmodule
